@@ -21,7 +21,10 @@ java_import com.nuix.superutilities.cases.BulkCaseProcessor
 
 $su = SuperUtilities.init($utilities,NUIX_VERSION)
 
+require File.join(script_directory,"HistoryHelper.rb")
+
 java_import org.joda.time.DateTime
+java_import org.joda.time.DateTimeZone
 
 dialog = TabbedCustomDialog.new("Quick Vol")
 main_tab = dialog.addTab("main_tab","Main")
@@ -29,6 +32,7 @@ main_tab.appendPathList("case_search_paths")
 main_tab.appendSaveFileChooser("report_file","Report File","Excel (*.xlsx)","xlsx")
 main_tab.appendCheckBox("allow_migrations","Allow Case Migrations",false)
 main_tab.getControl("case_search_paths").setFilesButtonVisible(false)
+main_tab.appendCheckBox("analyze_history","Analyze Case History",false)
 
 dialog.validateBeforeClosing do |values|
 	if values["case_search_paths"].size < 1
@@ -49,6 +53,11 @@ if dialog.getDialogResult == true
 	values = dialog.toMap
 	case_search_paths = values["case_search_paths"]
 	report_file = values["report_file"]
+	allow_migrations = values["allow_migrations"]
+
+	analyze_history = values["analyze_history"]
+
+	hh = HistoryHelper.new
 
 	# Are we appending to an existing file?
 	needs_headers = !java.io.File.new(report_file).exists
@@ -59,10 +68,24 @@ if dialog.getDialogResult == true
 
 	# Looks like this is a new file so we need to write headers
 	if needs_headers
-		report_sheet.appendRow([
-			"Case GUID","Batch Load Guid","Batch Load Date","Total Items",
+		report_headers = [
+			"Case Location","Case GUID","Batch Load Guid","Batch Load Date","Total Items",
 			"Total Audit Size Bytes","Total File Size Bytes"
-		])
+		]
+
+		if analyze_history
+			report_headers += [
+				"Days Since Load",
+				"Days Since Search",
+				"Days Since Annotation",
+				"Days Since Export",
+				"Days Since Import",
+				"Days Since Delete",
+				"Days Since Any",
+			]
+		end
+
+		report_sheet.appendRow(report_headers)
 
 		log_sheet.appendRow([
 			"Time","Type","Case Directory","Message"
@@ -93,6 +116,7 @@ if dialog.getDialogResult == true
 		# First pass, cases with issues are added to try_again_cases and tried again later.  If they have
 		# issues a second time they are not retried again after that
 		bcp = BulkCaseProcessor.new
+		bcp.setAllowCaseMigration(allow_migrations)
 		found_cases.each{|ci|bcp.addCaseDirectory(ci.getCaseDirectory)}
 		bcp.beforeOpeningCase do |case_info|
 			pd.setMainStatusAndLogIt("Processing #{case_info.getCaseDirectory}")
@@ -131,6 +155,7 @@ if dialog.getDialogResult == true
 			pd.logMessage("Processing #{nuix_case.getLocation}")
 			stats = nuix_case.getStatistics
 			nuix_case.getBatchLoads.each do |batch_load_details|
+
 				batch_load_guid = batch_load_details.getBatchId
 				batch_load_date = batch_load_details.getLoaded
 				query = "batch-load-guid:#{batch_load_guid}"
@@ -138,15 +163,38 @@ if dialog.getDialogResult == true
 				total_audited_bytes = stats.getAuditSize(query)
 				total_file_bytes = stats.getFileSize(query)
 
-				report_sheet.appendRow([
+				row_data = [
+					nuix_case.getLocation.getAbsolutePath,
 					nuix_case.getGuid,
 					batch_load_guid,
 					batch_load_date.toString,
 					total_items,
 					total_audited_bytes,
 					total_file_bytes
-				])
+				]
+
+				if analyze_history
+					history_data = [
+						hh.days_since_last("loadData",nuix_case), # Days Since Load
+						hh.days_since_last("search",nuix_case), # Days Since Search
+						hh.days_since_last("annotation",nuix_case), # Days Since Annotation
+						hh.days_since_last("export",nuix_case), # Days Since Export
+						hh.days_since_last("import",nuix_case), # Days Since Import
+						hh.days_since_last("delete",nuix_case), # Days Since Delete
+					]
+					
+					min_days = history_data.min
+					if min_days > hh.days_ago
+						min_days = "#{hh.days_ago}+"
+					end
+
+					row_data += history_data.map{|v| v > hh.days_ago ? "#{hh.days_ago}+" : v}
+					row_data << min_days
+				end
+
+				report_sheet.appendRow(row_data)
 			end
+
 			next true
 		end
 

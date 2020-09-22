@@ -21,7 +21,12 @@ java_import com.nuix.superutilities.cases.BulkCaseProcessor
 
 $su = SuperUtilities.init($utilities,NUIX_VERSION)
 
+require File.join(script_directory,"HistoryHelper.rb")
+
 java_import org.joda.time.DateTime
+java_import org.joda.time.DateTimeZone
+
+date_format = "yyyy/MM/dd"
 
 dialog = TabbedCustomDialog.new("Quick Vol")
 main_tab = dialog.addTab("main_tab","Main")
@@ -29,6 +34,7 @@ main_tab.appendPathList("case_search_paths")
 main_tab.appendSaveFileChooser("report_file","Report File","Excel (*.xlsx)","xlsx")
 main_tab.appendCheckBox("allow_migrations","Allow Case Migrations",false)
 main_tab.getControl("case_search_paths").setFilesButtonVisible(false)
+main_tab.appendCheckBox("analyze_history","Analyze Case History",false)
 
 dialog.validateBeforeClosing do |values|
 	if values["case_search_paths"].size < 1
@@ -49,6 +55,11 @@ if dialog.getDialogResult == true
 	values = dialog.toMap
 	case_search_paths = values["case_search_paths"]
 	report_file = values["report_file"]
+	allow_migrations = values["allow_migrations"]
+
+	analyze_history = values["analyze_history"]
+
+	hh = HistoryHelper.new
 
 	# Are we appending to an existing file?
 	needs_headers = !java.io.File.new(report_file).exists
@@ -56,13 +67,31 @@ if dialog.getDialogResult == true
 	xlsx = SimpleXlsx.new(report_file)
 	report_sheet = xlsx.getSheet("Report")
 	log_sheet = xlsx.getSheet("Log")
+	history_sheet = nil
+	if analyze_history
+		history_sheet = xlsx.getSheet("History Analysis")
+	end
 
 	# Looks like this is a new file so we need to write headers
 	if needs_headers
 		report_sheet.appendRow([
-			"Case GUID","Batch Load Guid","Batch Load Date","Total Items",
+			"Case Location","Case GUID","Batch Load Guid","Batch Load Date","Total Items",
 			"Total Audit Size Bytes","Total File Size Bytes"
 		])
+
+		if analyze_history
+			history_sheet.appendRow([
+				"Case Location",
+				"Case GUID",
+				"Last Load Event",
+				"Last Search Event",
+				"Last Annotation Event",
+				"Last Export Event",
+				"Last Import Event",
+				"Last Delete Event",
+				"Last Event",
+			])
+		end
 
 		log_sheet.appendRow([
 			"Time","Type","Case Directory","Message"
@@ -93,6 +122,7 @@ if dialog.getDialogResult == true
 		# First pass, cases with issues are added to try_again_cases and tried again later.  If they have
 		# issues a second time they are not retried again after that
 		bcp = BulkCaseProcessor.new
+		bcp.setAllowCaseMigration(allow_migrations)
 		found_cases.each{|ci|bcp.addCaseDirectory(ci.getCaseDirectory)}
 		bcp.beforeOpeningCase do |case_info|
 			pd.setMainStatusAndLogIt("Processing #{case_info.getCaseDirectory}")
@@ -129,8 +159,45 @@ if dialog.getDialogResult == true
 			next false if pd.abortWasRequested
 			pd.setMainProgress(case_index,total_cases)
 			pd.logMessage("Processing #{nuix_case.getLocation}")
+
+			# Record history info once per case to history sheet
+			if analyze_history
+				pd.logMessage("  Collecting history info...")
+
+				row_data = [
+					nuix_case.getLocation.getAbsolutePath,
+					nuix_case.getGuid,
+				]
+
+				history_data = [
+					hh.most_recent("loadData",nuix_case), # Last Load Event
+					hh.most_recent("search",nuix_case), # Last Search Event
+					hh.most_recent("annotation",nuix_case), # Last Annotation Event
+					hh.most_recent("export",nuix_case), # Last Export Event
+					hh.most_recent("import",nuix_case), # Last Import Event
+					hh.most_recent("delete",nuix_case), # Last Delete Event
+				]
+				
+				last_event = nil
+				history_data.each do |event|
+					next if event.nil?
+					event_start_date = event.getStartDate
+					if last_event.nil? || event_start_date.isAfter(last_event.getStartDate)
+						last_event = event
+					end
+				end
+
+				row_data += history_data.map{|event| event.nil? ? "Over #{hh.days_ago} days ago" : event.getStartDate.toString(date_format) }
+				row_data << (last_event.nil? ? "Over #{hh.days_ago} days ago" : last_event.getStartDate.toString(date_format))
+
+				history_sheet.appendRow(row_data)
+			end
+
+			# Collect batch load volume info
 			stats = nuix_case.getStatistics
 			nuix_case.getBatchLoads.each do |batch_load_details|
+				pd.logMessage("  Collecting batch load #{batch_load_details.getBatchId}...")
+
 				batch_load_guid = batch_load_details.getBatchId
 				batch_load_date = batch_load_details.getLoaded
 				query = "batch-load-guid:#{batch_load_guid}"
@@ -138,15 +205,19 @@ if dialog.getDialogResult == true
 				total_audited_bytes = stats.getAuditSize(query)
 				total_file_bytes = stats.getFileSize(query)
 
-				report_sheet.appendRow([
+				row_data = [
+					nuix_case.getLocation.getAbsolutePath,
 					nuix_case.getGuid,
 					batch_load_guid,
 					batch_load_date.toString,
 					total_items,
 					total_audited_bytes,
 					total_file_bytes
-				])
+				]
+
+				report_sheet.appendRow(row_data)
 			end
+
 			next true
 		end
 
@@ -214,6 +285,9 @@ if dialog.getDialogResult == true
 		end
 
 		report_sheet.autoFitColumns
+		if analyze_history
+			history_sheet.autoFitColumns
+		end
 		log_sheet.autoFitColumns
 		xlsx.save
 

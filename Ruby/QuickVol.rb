@@ -26,6 +26,8 @@ require File.join(script_directory,"HistoryHelper.rb")
 java_import org.joda.time.DateTime
 java_import org.joda.time.DateTimeZone
 
+date_format = "yyyy/MM/dd"
+
 dialog = TabbedCustomDialog.new("Quick Vol")
 main_tab = dialog.addTab("main_tab","Main")
 main_tab.appendPathList("case_search_paths")
@@ -65,27 +67,31 @@ if dialog.getDialogResult == true
 	xlsx = SimpleXlsx.new(report_file)
 	report_sheet = xlsx.getSheet("Report")
 	log_sheet = xlsx.getSheet("Log")
+	history_sheet = nil
+	if analyze_history
+		history_sheet = xlsx.getSheet("History Analysis")
+	end
 
 	# Looks like this is a new file so we need to write headers
 	if needs_headers
-		report_headers = [
+		report_sheet.appendRow([
 			"Case Location","Case GUID","Batch Load Guid","Batch Load Date","Total Items",
 			"Total Audit Size Bytes","Total File Size Bytes"
-		]
+		])
 
 		if analyze_history
-			report_headers += [
-				"Days Since Load",
-				"Days Since Search",
-				"Days Since Annotation",
-				"Days Since Export",
-				"Days Since Import",
-				"Days Since Delete",
-				"Days Since Any",
-			]
+			history_sheet.appendRow([
+				"Case Location",
+				"Case GUID",
+				"Last Load Event",
+				"Last Search Event",
+				"Last Annotation Event",
+				"Last Export Event",
+				"Last Import Event",
+				"Last Delete Event",
+				"Last Event",
+			])
 		end
-
-		report_sheet.appendRow(report_headers)
 
 		log_sheet.appendRow([
 			"Time","Type","Case Directory","Message"
@@ -153,8 +159,44 @@ if dialog.getDialogResult == true
 			next false if pd.abortWasRequested
 			pd.setMainProgress(case_index,total_cases)
 			pd.logMessage("Processing #{nuix_case.getLocation}")
+
+			# Record history info once per case to history sheet
+			if analyze_history
+				pd.logMessage("  Collecting history info...")
+
+				row_data = [
+					nuix_case.getLocation.getAbsolutePath,
+					nuix_case.getGuid,
+				]
+
+				history_data = [
+					hh.most_recent("loadData",nuix_case), # Last Load Event
+					hh.most_recent("search",nuix_case), # Last Search Event
+					hh.most_recent("annotation",nuix_case), # Last Annotation Event
+					hh.most_recent("export",nuix_case), # Last Export Event
+					hh.most_recent("import",nuix_case), # Last Import Event
+					hh.most_recent("delete",nuix_case), # Last Delete Event
+				]
+				
+				last_event = nil
+				history_data.each do |event|
+					next if event.nil?
+					event_start_date = event.getStartDate
+					if last_event.nil? || event_start_date.isAfter(last_event.getStartDate)
+						last_event = event
+					end
+				end
+
+				row_data += history_data.map{|event| event.nil? ? "Over #{hh.days_ago} days ago" : event.getStartDate.toString(date_format) }
+				row_data << (last_event.nil? ? "Over #{hh.days_ago} days ago" : last_event.getStartDate.toString(date_format))
+
+				history_sheet.appendRow(row_data)
+			end
+
+			# Collect batch load volume info
 			stats = nuix_case.getStatistics
 			nuix_case.getBatchLoads.each do |batch_load_details|
+				pd.logMessage("  Collecting batch load #{batch_load_details.getBatchId}...")
 
 				batch_load_guid = batch_load_details.getBatchId
 				batch_load_date = batch_load_details.getLoaded
@@ -172,25 +214,6 @@ if dialog.getDialogResult == true
 					total_audited_bytes,
 					total_file_bytes
 				]
-
-				if analyze_history
-					history_data = [
-						hh.days_since_last("loadData",nuix_case), # Days Since Load
-						hh.days_since_last("search",nuix_case), # Days Since Search
-						hh.days_since_last("annotation",nuix_case), # Days Since Annotation
-						hh.days_since_last("export",nuix_case), # Days Since Export
-						hh.days_since_last("import",nuix_case), # Days Since Import
-						hh.days_since_last("delete",nuix_case), # Days Since Delete
-					]
-					
-					min_days = history_data.min
-					if min_days > hh.days_ago
-						min_days = "#{hh.days_ago}+"
-					end
-
-					row_data += history_data.map{|v| v > hh.days_ago ? "#{hh.days_ago}+" : v}
-					row_data << min_days
-				end
 
 				report_sheet.appendRow(row_data)
 			end
@@ -262,6 +285,9 @@ if dialog.getDialogResult == true
 		end
 
 		report_sheet.autoFitColumns
+		if analyze_history
+			history_sheet.autoFitColumns
+		end
 		log_sheet.autoFitColumns
 		xlsx.save
 
